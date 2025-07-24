@@ -1,155 +1,68 @@
-# import fitz
-# import re
-# from sentence_transformers import SentenceTransformer, util
-
-# model = SentenceTransformer('./models/all-MiniLM-L6-v2')
-
-# heading_templates = [
-#     "Table of Contents", "Introduction", "Overview",
-#     "Business Outcomes", "Content", "References", "Acknowledgements"
-# ]
-# template_embeddings = model.encode(heading_templates, convert_to_tensor=True)
-
-# def classify_heading(text, font_size, is_bold):
-#     embedding = model.encode(text, convert_to_tensor=True)
-#     sim = util.cos_sim(embedding, template_embeddings).max().item()
-#     is_numbered = bool(re.match(r'^\d+(\.\d+)*\s', text))
-
-#     if is_numbered and font_size >= 14:
-#         return "H1" if '.' not in text.split()[0] else "H2"
-#     if font_size >= 17 and is_bold:
-#         return "H1"
-#     elif font_size >= 14 and (sim > 0.5 or is_bold):
-#         return "H2"
-#     elif font_size >= 13:
-#         return "H3"
-#     return None
-
-# def extract_outline(pdf_path):
-#     doc = fitz.open(pdf_path)
-#     outline = []
-#     title_parts = []
-
-#     for page_num, page in enumerate(doc):
-#         blocks = page.get_text("dict")["blocks"]
-
-#         for block in blocks:
-#             if "lines" not in block:
-#                 continue
-
-#             for line in block["lines"]:
-#                 line_text = " ".join(span["text"].strip() for span in line["spans"]).strip()
-#                 if not line_text:
-#                     continue
-
-#                 max_size = max(span["size"] for span in line["spans"])
-#                 is_bold_line = any("Bold" in span["font"] for span in line["spans"])
-
-#                 if page_num == 0 and is_bold_line and max_size > 18:
-#                     title_parts.append(line_text)
-
-#                 tag = classify_heading(line_text, max_size, is_bold_line)
-#                 if tag:
-#                     outline.append({
-#                         "level": tag,
-#                         "text": line_text,
-#                         "page": page_num + 1
-#                     })
-
-#     return {
-#         "title": " ".join(title_parts).strip(),
-#         "outline": outline
-#     }
-
+from typing import Dict, Any, List
 import fitz
-import re
 import json
 import os
-from typing import Dict, List, Any
-
-def classify_heading_level(text: str, font_size: float, is_bold: bool, 
-                          page_num: int, y_position: float) -> str:
-    """
-    Classify heading level based on multiple criteria
-    """
-    # Remove leading/trailing whitespace
-    text = text.strip()
-    
-    # Skip very short text or common non-headings
-    if len(text) < 3 or text.lower() in ['page', 'of', 'and', 'the', 'for']:
-        return None
-    
-    # Check for numbered headings (strongest indicator)
-    if re.match(r'^\d+\.\s', text):  # "1. Introduction"
-        return "H1"
-    elif re.match(r'^\d+\.\d+\s', text):  # "1.1 Overview"
-        return "H2"
-    elif re.match(r'^\d+\.\d+\.\d+\s', text):  # "1.1.1 Details"
-        return "H3"
-    
-    # Check for common heading patterns
-    heading_keywords = [
-        r'^(introduction|overview|conclusion|summary|references|appendix|acknowledgements)',
-        r'^(table of contents|revision history|abstract|executive summary)',
-        r'^(chapter|section|part)\s+\d+',
-        r'^(background|methodology|results|discussion|future work)'
-    ]
-    
-    text_lower = text.lower()
-    for pattern in heading_keywords:
-        if re.search(pattern, text_lower):
-            if font_size >= 16 or is_bold:
-                return "H1"
-            else:
-                return "H2"
-    
-    # Font size and formatting based classification
-    if font_size >= 18:
-        return "H1"
-    elif font_size >= 14 and is_bold:
-        return "H1" if page_num <= 2 else "H2"  # First pages more likely to have H1
-    elif font_size >= 13:
-        return "H2" if is_bold else "H3"
-    elif font_size >= 12 and is_bold:
-        return "H3"
-    
-    return None
+from collections import defaultdict
+import re
 
 def extract_title_from_first_page(page) -> str:
-    """
-    Extract document title from first page
-    """
-    title_candidates = []
+    """Extract title from the first page"""
     blocks = page.get_text("dict")["blocks"]
+    max_font_size = 0
+    title = ""
     
     for block in blocks:
         if "lines" not in block:
             continue
-            
         for line in block["lines"]:
-            line_text = " ".join(span["text"].strip() for span in line["spans"]).strip()
-            if not line_text:
-                continue
-            
-            # Get text properties
-            max_size = max(span["size"] for span in line["spans"]) if line["spans"] else 0
-            is_bold = any("Bold" in span.get("font", "") for span in line["spans"])
-            
-            # Title heuristics
-            if (len(line_text.split()) >= 3 and 
-                not line_text.endswith(":") and
-                not re.match(r'^\d+\.', line_text) and
-                (max_size >= 16 or is_bold) and
-                not line_text.lower().startswith(('page', 'chapter', 'section'))):
-                
-                title_candidates.append((line_text, max_size, is_bold))
+            for span in line["spans"]:
+                if span["size"] > max_font_size and len(span["text"].strip()) > 3:
+                    max_font_size = span["size"]
+                    title = span["text"].strip()
+    return title
+
+def is_footer_text(text: str, y_pos: float, page_height: float, position_text_map: dict, page_num: int) -> bool:
+    """Check if text is likely a footer"""
+    # Check if text matches common footer patterns
+    footer_patterns = [
+        r'^Page\s+\d+(\s+of\s+\d+)?$',
+        r'^\d+$',
+        r'^Chapter\s+\d+$',
+        r'^\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s*$',
+        r'^[A-Za-z0-9\s]{1,10}$',
+        r'^\s*[ivx]+\s*$',
+        r'^[A-Za-z0-9\s\-_]{1,20}\s+\|\s+\d+$'
+    ]
     
-    # Return the largest/boldest title candidate
-    if title_candidates:
-        title_candidates.sort(key=lambda x: (x[2], x[1]), reverse=True)  # Sort by bold, then size
-        return title_candidates[0][0]
+    if any(re.match(pattern, text.lower()) for pattern in footer_patterns):
+        return True
     
-    return ""
+    # Check position (top 10% or bottom 10% of page)
+    margin = page_height * 0.1
+    if y_pos > (page_height - margin) or y_pos < margin:
+        # Check if similar text appears in same position on other pages
+        pos_key = round(y_pos / 10) * 10
+        similar_texts = position_text_map.get(pos_key, [])
+        similar_count = sum(1 for t, p in similar_texts 
+                          if p != page_num and len(t) > 3 
+                          and (t in text or text in t))
+        return similar_count >= 2
+        
+    return False
+
+def merge_fragments(fragments: List[str]) -> str:
+    """Merge text fragments that might be split"""
+    if not fragments:
+        return ""
+    result = fragments[0]
+    for i in range(1, len(fragments)):
+        if fragments[i] in result or result in fragments[i]:
+            continue
+        if any(result.endswith(fragments[i][:j]) or 
+               fragments[i].startswith(result[-j:]) 
+               for j in range(1, min(len(result), len(fragments[i])) + 1)):
+            result += fragments[i][min(len(result), len(fragments[i])):]
+    return result
 
 def extract_outline(pdf_path: str) -> Dict[str, Any]:
     """
@@ -159,47 +72,82 @@ def extract_outline(pdf_path: str) -> Dict[str, Any]:
         doc = fitz.open(pdf_path)
         outline = []
         title = ""
-        seen_headings = set()
+        position_text_map = defaultdict(list)
+        
+        # First pass: collect text positions
+        for page_num, page in enumerate(doc):
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                if "lines" not in block:
+                    continue
+                for line in block["lines"]:
+                    y_pos = round(line["bbox"][1] / 10) * 10
+                    text = " ".join(span["text"].strip() for span in line["spans"]).strip()
+                    if text:
+                        position_text_map[y_pos].append((text, page_num))
         
         # Extract title from first page
         if len(doc) > 0:
             title = extract_title_from_first_page(doc[0])
-        
-        # Process each page
+
+        # Group text by position for fragment merging
+        text_groups = defaultdict(list)
+        seen_headings = set()
+
         for page_num, page in enumerate(doc):
             blocks = page.get_text("dict")["blocks"]
-            
             for block in blocks:
                 if "lines" not in block:
                     continue
-                
                 for line in block["lines"]:
-                    line_text = " ".join(span["text"].strip() for span in line["spans"]).strip()
-                    if not line_text or line_text in seen_headings:
+                    if not line.get("spans"):
                         continue
                     
-                    # Get text properties
-                    max_size = max(span["size"] for span in line["spans"]) if line["spans"] else 0
+                    text = " ".join(span["text"].strip() for span in line["spans"]).strip()
+                    if not text:
+                        continue
+                        
+                    y_pos = line["bbox"][1]
+                    max_size = max(span["size"] for span in line["spans"])
                     is_bold = any("Bold" in span.get("font", "") for span in line["spans"])
-                    y_position = line["bbox"][1] if "bbox" in line else 0
                     
-                    # Classify heading level
-                    level = classify_heading_level(line_text, max_size, is_bold, page_num, y_position)
-                    
-                    if level:
-                        outline.append({
-                            "level": level,
-                            "text": line_text,
-                            "page": page_num + 1
-                        })
-                        seen_headings.add(line_text)
-        
+                    # Skip likely headers/footers
+                    if is_footer_text(text, y_pos, page.rect.height, position_text_map, page_num):
+                        continue
+                        
+                    # Group similar text by position and size
+                    group_key = (page_num, round(y_pos/5)*5, max_size)
+                    text_groups[group_key].append(text)
+
+        # Process grouped text
+        for (page_num, _, size), texts in text_groups.items():
+            merged_text = merge_fragments(texts)
+            if not merged_text or merged_text in seen_headings or len(merged_text) < 3:
+                continue
+                
+            # Determine heading level
+            if size >= 16:
+                level = "H1"
+            elif size >= 14:
+                level = "H2"
+            elif size >= 12:
+                level = "H3"
+            else:
+                continue
+                
+            outline.append({
+                "level": level,
+                "text": merged_text,
+                "page": page_num + 1
+            })
+            seen_headings.add(merged_text)
+
         doc.close()
         return {
             "title": title,
             "outline": outline
         }
-        
+
     except Exception as e:
         print(f"Error processing {pdf_path}: {str(e)}")
         return {
