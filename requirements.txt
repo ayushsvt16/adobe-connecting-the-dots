@@ -1,0 +1,4 @@
+flask
+pymupdf
+scikit-learn
+sentence-transformers
